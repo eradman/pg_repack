@@ -41,7 +41,8 @@ pg_repackでは再編成する方法として次のものが選択できます�
 
 .. NOTICE:
   
-  * Only superusers can use the utility.
+  * Only superusers or owners of tables and indexes can use the utility. To run
+    pg_repack as an owner you need to use the option `--no-superuser-check`.
   * Target table must have a PRIMARY KEY, or at least a UNIQUE total index on a
     NOT NULL column.
 
@@ -62,7 +63,7 @@ pg_repackでは再編成する方法として次のものが選択できます�
   ------------
   
   PostgreSQL versions
-      PostgreSQL 9.5, 9.6, 10, 11, 12, 13, 14, 15, 16, 17.
+      PostgreSQL 9.5, 9.6, 10, 11, 12, 13, 14, 15, 16, 17, 18.
   
       PostgreSQL 9.4 and before it are not supported.
   
@@ -196,39 +197,40 @@ pg_repackもしくはpg_reorgの古いバージョンからのアップグレー
   The following options can be specified in ``OPTIONS``.
   
   Options:
-    -a, --all                     repack all databases
-    -t, --table=TABLE             repack specific table only
-    -I, --parent-table=TABLE      repack specific parent table and its inheritors
-    -c, --schema=SCHEMA           repack tables in specific schema only
-    -s, --tablespace=TBLSPC       move repacked tables to a new tablespace
-    -S, --moveidx                 move repacked indexes to *TBLSPC* too
-    -o, --order-by=COLUMNS        order by columns instead of cluster keys
-    -n, --no-order                do vacuum full instead of cluster
-    -N, --dry-run                 print what would have been repacked and exit
-    -j, --jobs=NUM                Use this many parallel jobs for each table
-    -i, --index=INDEX             move only the specified index
-    -x, --only-indexes            move only indexes of the specified table
-    -T, --wait-timeout=SECS       timeout to cancel other backends on conflict
-    -D, --no-kill-backend         don't kill other backends when timed out
-    -Z, --no-analyze              don't analyze at end
-    -k, --no-superuser-check      skip superuser checks in client
-    -C, --exclude-extension       don't repack tables which belong to specific extension
-        --error-on-invalid-index  don't repack when invalid index is found
-        --switch-threshold        switch tables when that many tuples are left to catchup
+    -a, --all                          repack all databases
+    -t, --table=TABLE                  repack specific table only
+    -I, --parent-table=TABLE           repack specific parent table and its inheritors
+    -c, --schema=SCHEMA                repack tables in specific schema only
+    -s, --tablespace=TBLSPC            move repacked tables to a new tablespace
+    -S, --moveidx                      move repacked indexes to *TBLSPC* too
+    -o, --order-by=COLUMNS             order by columns instead of cluster keys
+    -n, --no-order                     do vacuum full instead of cluster
+    -N, --dry-run                      print what would have been repacked and exit
+    -j, --jobs=NUM                     Use this many parallel jobs for each table
+    -i, --index=INDEX                  move only the specified index
+    -x, --only-indexes                 move only indexes of the specified table
+    -T, --wait-timeout=SECS            timeout to cancel other backends on conflict
+    -D, --no-kill-backend              don't kill other backends when timed out
+    -Z, --no-analyze                   don't analyze at end
+    -k, --no-superuser-check           skip superuser checks in client
+    -C, --exclude-extension            don't repack tables which belong to specific extension
+        --no-error-on-invalid-index    repack even though invalid index is found
+        --error-on-invalid-index       don't repack when invalid index is found, deprecated, as this is the default behavior now
+        --switch-threshold             switch tables when that many tuples are left to catchup
   
   Connection options:
-    -d, --dbname=DBNAME           database to connect
-    -h, --host=HOSTNAME           database server host or socket directory
-    -p, --port=PORT               database server port
-    -U, --username=USERNAME       user name to connect as
-    -w, --no-password             never prompt for password
-    -W, --password                force password prompt
+    -d, --dbname=DBNAME                database to connect
+    -h, --host=HOSTNAME                database server host or socket directory
+    -p, --port=PORT                    database server port
+    -U, --username=USERNAME            user name to connect as
+    -w, --no-password                  never prompt for password
+    -W, --password                     force password prompt
   
   Generic options:
-    -e, --echo                    echo queries
-    -E, --elevel=LEVEL            set output message level
-    --help                        show this help, then exit
-    --version                     output version information, then exit
+    -e, --echo                         echo queries
+    -E, --elevel=LEVEL                 set output message level
+    --help                             show this help, then exit
+    --version                          output version information, then exit
 
 利用方法
 ---------
@@ -772,10 +774,9 @@ pg_repackはGiSTインデックスを使ってテーブルを再編成するこ�
 .. DDL commands
   ^^^^^^^^^^^^
   
-  You will not be able to perform DDL commands of the target table(s) **except**
-  VACUUM or ANALYZE while pg_repack is working. pg_repack will hold an
-  ACCESS SHARE lock on the target table during a full-table repack, to enforce
-  this restriction.
+  You will not be able to perform DDL commands of the target table(s) while
+  pg_repack is working. pg_repack will hold an SHARE UPDATE EXCLUSIVE lock on the
+  target table during a full-table repack, to enforce this restriction.
   
   If you are using version 1.1.8 or earlier, you must not attempt to perform any
   DDL commands on the target table(s) while pg_repack is running. In many cases
@@ -785,9 +786,9 @@ pg_repackはGiSTインデックスを使ってテーブルを再編成するこ�
 DDLコマンド
 ^^^^^^^^^^^^
 
-pg_repackを実行している間、VACUUMもしくはANALYZE以外のDDLコマンドを対象の
+pg_repackを実行している間、DDLコマンドを対象の
 テーブルに対して実行することはできません。何故ならば、pg_repackは
-ACCESS SHAREロックを対象テーブルに対して保持しつづけるからです。
+SHARE UPDATE EXCLUSIVEロックを対象テーブルに対して保持しつづけるからです。
 
 バージョン1.1.8もしくはそれ以前のバージョンを使っている場合、あらゆるDDL
 コマンドをpg_repackが走っているテーブルに対して実行することができません。
@@ -816,8 +817,8 @@ ACCESS SHAREロックを対象テーブルに対して保持しつづけるか�
   pg_repack will only hold an ACCESS EXCLUSIVE lock for a short period during
   initial setup (steps 1 and 2 above) and during the final swap-and-drop phase
   (steps 6 and 7). For the rest of its time, pg_repack only needs
-  to hold an ACCESS SHARE lock on the original table, meaning INSERTs, UPDATEs,
-  and DELETEs may proceed as usual.
+  to hold an SHARE UPDATE EXCLUSIVE lock on the original table, meaning INSERTs,
+  UPDATEs, and DELETEs may proceed as usual.
 
 テーブル再編成
 ^^^^^^^^^^^^^^^
@@ -833,7 +834,7 @@ ACCESS SHAREロックを対象テーブルに対して保持しつづけるか�
 7. 元のテーブルを削除します
 
 pg_repackは上の手順の中で、始めの1.と2.の時点、および最後の6.と7.の時点で対象のテーブルに対する
-ACCESS EXCLUSIVEロックを取得します。その他のステップでは、ACCESS SHAREロックを必要とするだけなので、
+ACCESS EXCLUSIVEロックを取得します。その他のステップでは、SHARE UPDATE EXCLUSIVEロックを必要とするだけなので、
 元のテーブルに対するINSERT, UPDATE, DELETE操作は通常通りに実行されます。
 
 .. Index Only Repacks

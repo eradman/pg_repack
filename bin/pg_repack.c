@@ -10,18 +10,6 @@
  * @brief Client Modules
  */
 
-const char *PROGRAM_URL		= "https://reorg.github.io/pg_repack/";
-const char *PROGRAM_ISSUES	= "https://github.com/reorg/pg_repack/issues";
-
-#ifdef REPACK_VERSION
-/* macro trick to stringify a macro expansion */
-#define xstr(s) str(s)
-#define str(s) #s
-const char *PROGRAM_VERSION = xstr(REPACK_VERSION);
-#else
-const char *PROGRAM_VERSION = "unknown";
-#endif
-
 #include "pgut/pgut-fe.h"
 
 #include <errno.h>
@@ -41,6 +29,17 @@ const char *PROGRAM_VERSION = "unknown";
 #include <sys/select.h>
 #endif
 
+const char *PROGRAM_URL		= "https://reorg.github.io/pg_repack/";
+const char *PROGRAM_ISSUES	= "https://github.com/reorg/pg_repack/issues";
+
+#ifdef REPACK_VERSION
+/* macro trick to stringify a macro expansion */
+#define xstr(s) str(s)
+#define str(s) #s
+const char *PROGRAM_VERSION = xstr(REPACK_VERSION);
+#else
+const char *PROGRAM_VERSION = "unknown";
+#endif
 
 /*
  * APPLY_COUNT_DEFAULT: Number of applied logs per transaction. Larger values
@@ -222,6 +221,7 @@ static bool repack_table_indexes(PGresult *index_details);
 static bool repack_all_indexes(char *errbuf, size_t errsize);
 static void repack_cleanup(bool fatal, const repack_table *table);
 static void repack_cleanup_callback(bool fatal, void *userdata);
+static void repack_cleanup_index(bool fatal, void *userdata);
 static bool rebuild_indexes(const repack_table *table);
 
 static char *getstr(PGresult *res, int row, int col);
@@ -258,7 +258,9 @@ static unsigned int		temp_obj_num = 0; /* temporary objects counter */
 static bool				no_kill_backend = false; /* abandon when timed-out */
 static bool				no_superuser_check = false;
 static SimpleStringList	exclude_extension_list = {NULL, NULL}; /* don't repack tables of these extensions */
-static bool 			error_on_invalid_index = false; /* don't repack when invalid index is found */
+static bool 			no_error_on_invalid_index = false; /* repack even though invalid index is found */
+static bool 			error_on_invalid_index = false; /* don't repack when invalid index is found,
+								 * deprecated, this the default behavior now */
 static int				apply_count = APPLY_COUNT_DEFAULT;
 static int				switch_threshold = SWITCH_THRESHOLD_DEFAULT;
 
@@ -290,6 +292,7 @@ static pgut_option options[] =
 	{ 'b', 'D', "no-kill-backend", &no_kill_backend },
 	{ 'b', 'k', "no-superuser-check", &no_superuser_check },
 	{ 'l', 'C', "exclude-extension", &exclude_extension_list },
+	{ 'b', 4, "no-error-on-invalid-index", &no_error_on_invalid_index },
 	{ 'b', 3, "error-on-invalid-index", &error_on_invalid_index },
 	{ 'i', 2, "apply-count", &apply_count },
 	{ 'i', 1, "switch-threshold", &switch_threshold },
@@ -871,8 +874,13 @@ repack_one_database(const char *orderby, char *errbuf, size_t errsize)
 		appendStringInfoString(&sql, ")");
 	}
 
-	/* Ensure the regression tests get a consistent ordering of tables */
-	appendStringInfoString(&sql, " ORDER BY t.relname, t.schemaname");
+	/* Ensure the regression tests get a consistent ordering of tables
+	 * Otherwise repack small objects first to free space on disk
+	 */
+	if (getenv("MAKELEVEL"))
+		appendStringInfoString(&sql, " ORDER BY t.relname, t.schemaname");
+	else
+		appendStringInfoString(&sql, " ORDER BY pg_relation_size(t.relid)");
 
 	/* double check the parameters array is sane */
 	if (iparam != num_params)
@@ -1311,7 +1319,7 @@ repack_one_table(repack_table *table, const char *orderby)
 
 	/* First, just display a warning message for any invalid indexes
 	 * which may be on the table (mostly to match the behavior of 1.1.8),
-	 * if --error-on-invalid-index is not set
+	 * if --no-error-on-invalid-index is set
 	 */
 	indexres = execute(
 		"SELECT pg_get_indexdef(indexrelid)"
@@ -1322,7 +1330,8 @@ repack_one_table(repack_table *table, const char *orderby)
 	{
 		const char *indexdef;
 		indexdef = getstr(indexres, j, 0);
-		if (error_on_invalid_index) {
+
+		if (!no_error_on_invalid_index) {
 			elog(WARNING, "Invalid index: %s", indexdef);
 			goto cleanup;
 		} else {
@@ -1390,8 +1399,8 @@ repack_one_table(repack_table *table, const char *orderby)
 	command(sql.data, 0, NULL);
 
 	/* While we are still holding an AccessExclusive lock on the table, submit
-	 * the request for an AccessShare lock asynchronously from conn2.
-	 * We want to submit this query in conn2 while connection's
+	 * the request for an ShareUpdateExclusiveLock lock asynchronously from
+	 * conn2. We want to submit this query in conn2 while connection's
 	 * transaction still holds its lock, so that no DDL may sneak in
 	 * between the time that connection commits and conn2 gets its lock.
 	 */
@@ -1407,12 +1416,12 @@ repack_one_table(repack_table *table, const char *orderby)
 
 	/*
 	 * Not using lock_access_share() here since we know that
-	 * it's not possible to obtain the ACCESS SHARE lock right now
+	 * it's not possible to obtain the SHARE UPDATE EXCLUSIVE lock right now
 	 * in conn2, since the primary connection holds ACCESS EXCLUSIVE.
 	 */
-	printfStringInfo(&sql, "LOCK TABLE %s IN ACCESS SHARE MODE",
+	printfStringInfo(&sql, "LOCK TABLE %s IN SHARE UPDATE EXCLUSIVE MODE",
 					 table->target_name);
-	elog(DEBUG2, "LOCK TABLE %s IN ACCESS SHARE MODE", table->target_name);
+	elog(DEBUG2, "LOCK TABLE %s IN SHARE UPDATE EXCLUSIVE MODE", table->target_name);
 	if (PQsetnonblocking(conn2, 1))
 	{
 		elog(WARNING, "Unable to set conn2 nonblocking.");
@@ -1429,7 +1438,7 @@ repack_one_table(repack_table *table, const char *orderby)
 	 * look for and cancel any (potentially dangerous) DDL commands which
 	 * might also be waiting on our table lock at this point --
 	 * it's not safe to let them wait, because they may grab their
-	 * AccessExclusive lock before conn2 gets its AccessShare lock,
+	 * AccessExclusive lock before conn2 gets its ShareUpdateExclusiveLock lock,
 	 * and perform unsafe DDL on the table.
 	 *
 	 * Normally, lock_access_share() would take care of this for us,
@@ -1445,7 +1454,7 @@ repack_one_table(repack_table *table, const char *orderby)
 	}
 
 	/* We're finished killing off any unsafe DDL. COMMIT in our main
-	 * connection, so that conn2 may get its AccessShare lock.
+	 * connection, so that conn2 may get its ShareUpdateExclusiveLock lock.
 	 */
 	command("COMMIT", 0, NULL);
 
@@ -1460,7 +1469,7 @@ repack_one_table(repack_table *table, const char *orderby)
 	 */
 	while ((res = PQgetResult(conn2)))
 	{
-		elog(DEBUG2, "Waiting on ACCESS SHARE lock...");
+		elog(DEBUG2, "Waiting on SHARE UPDATE EXCLUSIVE lock...");
 		if (PQresultStatus(res) != PGRES_COMMAND_OK)
 		{
 			elog(WARNING, "Error with LOCK TABLE: %s", PQerrorMessage(conn2));
@@ -1511,10 +1520,10 @@ repack_one_table(repack_table *table, const char *orderby)
 	 * for the create_table command to go through, so go ahead and obtain
 	 * the lock explicitly.
 	 *
-	 * Since conn2 has been diligently holding its AccessShare lock, it
-	 * is possible that another transaction has been waiting to acquire
-	 * an AccessExclusive lock on the table (e.g. a concurrent ALTER TABLE
-	 * or TRUNCATE which we must not allow). If there are any such
+	 * Since conn2 has been diligently holding its ShareUpdateExclusiveLock
+	 * lock, it is possible that another transaction has been waiting to
+	 * acquire an AccessExclusive lock on the table (e.g. a concurrent ALTER
+	 * TABLE or TRUNCATE which we must not allow). If there are any such
 	 * transactions, lock_access_share() will kill them so that our
 	 * CREATE TABLE ... AS SELECT does not deadlock waiting for an
 	 * AccessShare lock.
@@ -1609,10 +1618,10 @@ repack_one_table(repack_table *table, const char *orderby)
 
 	/*
 	 * 5. Swap: will be done with conn2, since it already holds an
-	 *    AccessShare lock.
+	 * ShareUpdateExclusiveLock lock.
 	 */
 	elog(DEBUG2, "---- swap ----");
-	/* Bump our existing AccessShare lock to AccessExclusive */
+	/* Bump our existing ShareUpdateExclusive lock to AccessExclusive */
 
 	if (!(lock_exclusive(conn2, utoa(table->target_oid, buffer),
 						 table->lock_table, false)))
@@ -1642,22 +1651,16 @@ repack_one_table(repack_table *table, const char *orderby)
 	pgut_command(conn2, "COMMIT", 0, NULL);
 
 	/*
-	 * 6. Drop.
+	 * 6. Drop temporary objects. We don't need to acquire ACCESS EXCLUSIVE
+	 * lock here since repack_swap() already dropped the repack_trigger trigger.
 	 */
 	elog(DEBUG2, "---- drop ----");
 
 	command("BEGIN ISOLATION LEVEL READ COMMITTED", 0, NULL);
-	if (!(lock_exclusive(connection, utoa(table->target_oid, buffer),
-						 table->lock_table, false)))
-	{
-		elog(WARNING, "lock_exclusive() failed in connection for %s",
-			 table->target_name);
-		goto cleanup;
-	}
-
 	params[1] = utoa(temp_obj_num, indexbuffer);
 	command("SELECT repack.repack_drop($1, $2)", 2, params);
 	command("COMMIT", 0, NULL);
+
 	temp_obj_num = 0; /* reset temporary object counter after cleanup */
 
 	/*
@@ -1794,6 +1797,8 @@ lock_access_share(PGconn *conn, Oid relid, const char *target_name)
 	int				i;
 	bool			ret = true;
 
+	pgut_command(conn, "SAVEPOINT repack_sp1", 0, NULL);
+
 	initStringInfo(&sql);
 
 	for (i = 1; ; i++)
@@ -1802,16 +1807,14 @@ lock_access_share(PGconn *conn, Oid relid, const char *target_name)
 		PGresult   *res;
 		int			wait_msec;
 
-		pgut_command(conn, "SAVEPOINT repack_sp1", 0, NULL);
-
 		duration = time(NULL) - start;
 
 		/* Cancel queries unconditionally, i.e. don't bother waiting
 		 * wait_timeout as lock_exclusive() does -- the only queries we
 		 * should be killing are disallowed DDL commands hanging around
 		 * for an AccessExclusive lock, which must be deadlocked at
-		 * this point anyway since conn2 holds its AccessShare lock
-		 * already.
+		 * this point anyway since conn2 holds its ShareUpdateExclusiveLock
+		 * lock already.
 		 */
 		if (duration > (wait_timeout * 2))
 			ret = kill_ddl(conn, relid, true);
@@ -1851,6 +1854,13 @@ lock_access_share(PGconn *conn, Oid relid, const char *target_name)
 	}
 
 	termStringInfo(&sql);
+
+	/*
+	 * Make sure that the current transaction isn't in failed state before
+	 * releasing the savepoint
+	 */
+	if (PQtransactionStatus(conn) == PQTRANS_INTRANS)
+		pgut_command(conn, "RELEASE SAVEPOINT repack_sp1", 0, NULL);
 	pgut_command(conn, "RESET lock_timeout", 0, NULL);
 	return ret;
 }
@@ -1899,9 +1909,10 @@ static bool advisory_lock(PGconn *conn, const char *relid)
  *  conn: connection to use
  *  relid: OID of relation
  *  lock_query: LOCK TABLE ... IN ACCESS EXCLUSIVE query to be executed
- *  start_xact: whether we will issue a BEGIN ourselves. If not, we will
- *              use a SAVEPOINT and ROLLBACK TO SAVEPOINT if our query
- *              times out, to avoid leaving the transaction in error state.
+ *  start_xact: whether we will issue a BEGIN ourselves. Regardless of the
+ *              value we will use a SAVEPOINT and ROLLBACK TO SAVEPOINT if our
+ *              query times out, to avoid leaving the transaction in error
+ *              state.
  */
 static bool
 lock_exclusive(PGconn *conn, const char *relid, const char *lock_query, bool start_xact)
@@ -1910,17 +1921,16 @@ lock_exclusive(PGconn *conn, const char *relid, const char *lock_query, bool sta
 	int			i;
 	bool		ret = true;
 
+	if (start_xact)
+		pgut_command(conn, "BEGIN ISOLATION LEVEL READ COMMITTED", 0, NULL);
+	pgut_command(conn, "SAVEPOINT repack_sp1", 0, NULL);
+
 	for (i = 1; ; i++)
 	{
 		time_t		duration;
 		char		sql[1024];
 		PGresult   *res;
 		int			wait_msec;
-
-		if (start_xact)
-			pgut_command(conn, "BEGIN ISOLATION LEVEL READ COMMITTED", 0, NULL);
-		else
-			pgut_command(conn, "SAVEPOINT repack_sp1", 0, NULL);
 
 		duration = time(NULL) - start;
 		if (duration > wait_timeout)
@@ -1931,10 +1941,7 @@ lock_exclusive(PGconn *conn, const char *relid, const char *lock_query, bool sta
 				ret = false;
 
 				/* Before exit the loop reset the transaction */
-				if (start_xact)
-					pgut_rollback(conn);
-				else
-					pgut_command(conn, "ROLLBACK TO SAVEPOINT repack_sp1", 0, NULL);
+				pgut_command(conn, "ROLLBACK TO SAVEPOINT repack_sp1", 0, NULL);
 				break;
 			}
 			else
@@ -1977,10 +1984,7 @@ lock_exclusive(PGconn *conn, const char *relid, const char *lock_query, bool sta
 		{
 			/* retry if lock conflicted */
 			CLEARPGRES(res);
-			if (start_xact)
-				pgut_rollback(conn);
-			else
-				pgut_command(conn, "ROLLBACK TO SAVEPOINT repack_sp1", 0, NULL);
+			pgut_command(conn, "ROLLBACK TO SAVEPOINT repack_sp1", 0, NULL);
 			continue;
 		}
 		else
@@ -1993,6 +1997,14 @@ lock_exclusive(PGconn *conn, const char *relid, const char *lock_query, bool sta
 		}
 	}
 
+	/*
+	 * Make sure that the current transaction isn't in failed state before
+	 * releasing the savepoint
+	 */
+	if (PQtransactionStatus(conn) == PQTRANS_INTRANS)
+		pgut_command(conn, "RELEASE SAVEPOINT repack_sp1", 0, NULL);
+	if (!ret && start_xact)
+		pgut_rollback(conn);
 	pgut_command(conn, "RESET lock_timeout", 0, NULL);
 	return ret;
 }
@@ -2075,6 +2087,39 @@ repack_cleanup(bool fatal, const repack_table *table)
 }
 
 /*
+ * Cleanup temporary objects, created during index repacking (with option
+ * --index-only), on error.
+ */
+static void
+repack_cleanup_index(bool fatal, void *userdata)
+{
+	StringInfoData sql, sql_drop;
+	PGresult   *index_details = (PGresult *) userdata;
+	char	   *schema_name;
+	int			num;
+
+	schema_name = getstr(index_details, 0, 5);
+	num = PQntuples(index_details);
+
+	initStringInfo(&sql);
+	initStringInfo(&sql_drop);
+
+	appendStringInfoString(&sql, "DROP INDEX CONCURRENTLY IF EXISTS ");
+	appendStringInfo(&sql, "\"%s\".",  schema_name);
+
+	for (int i = 0; i < num; i++)
+	{
+		Oid			index = getoid(index_details, i, 1);
+
+		resetStringInfo(&sql_drop);
+		appendStringInfo(&sql_drop, "%s\"index_%u\"", sql.data, index);
+		command(sql_drop.data, 0, NULL);
+	}
+	termStringInfo(&sql_drop);
+	termStringInfo(&sql);
+}
+
+/*
  * Indexes of a table are repacked.
  */
 static bool
@@ -2082,7 +2127,7 @@ repack_table_indexes(PGresult *index_details)
 {
 	bool				ret = false;
 	PGresult			*res = NULL, *res2 = NULL;
-	StringInfoData		sql, sql_drop;
+	StringInfoData		sql;
 	char				buffer[2][12];
 	const char			*create_idx, *schema_name, *table_name, *params[3];
 	Oid					table, index;
@@ -2112,6 +2157,8 @@ repack_table_indexes(PGresult *index_details)
 	if (!advisory_lock(connection, params[1]))
 		ereport(ERROR, (errcode(EINVAL),
 			errmsg("Unable to obtain advisory lock on \"%s\"", table_name)));
+
+	pgut_atexit_push(repack_cleanup_index, index_details);
 
 	for (i = 0; i < num; i++)
 	{
@@ -2237,30 +2284,16 @@ repack_table_indexes(PGresult *index_details)
 	pgut_command(connection, "COMMIT", 0, NULL);
 	ret = true;
 
-drop_idx:
-	resetStringInfo(&sql);
-	initStringInfo(&sql_drop);
-	appendStringInfoString(&sql, "DROP INDEX CONCURRENTLY ");
-	appendStringInfo(&sql, "\"%s\".",  schema_name);
+	pgut_atexit_pop(repack_cleanup_index, index_details);
 
-	for (i = 0; i < num; i++)
-	{
-		index = getoid(index_details, i, 1);
-		if (repacked_indexes[i])
-		{
-			initStringInfo(&sql_drop);
-			appendStringInfo(&sql_drop, "%s\"index_%u\"", sql.data, index);
-			command(sql_drop.data, 0, NULL);
-		}
-		else
-			elog(INFO, "Skipping drop of index_%u", index);
-	}
-	termStringInfo(&sql_drop);
-	termStringInfo(&sql);
+drop_idx:
+	if (num_repacked > 0)
+		repack_cleanup_index(false, index_details);
 
 done:
 	CLEARPGRES(res);
 	free(repacked_indexes);
+	termStringInfo(&sql);
 
 	return ret;
 }
@@ -2402,24 +2435,25 @@ pgut_help(bool details)
 		return;
 
 	printf("Options:\n");
-	printf("  -a, --all                     repack all databases\n");
-	printf("  -t, --table=TABLE             repack specific table only\n");
-	printf("  -I, --parent-table=TABLE      repack specific parent table and its inheritors\n");
-	printf("  -c, --schema=SCHEMA           repack tables in specific schema only\n");
-	printf("  -s, --tablespace=TBLSPC       move repacked tables to a new tablespace\n");
-	printf("  -S, --moveidx                 move repacked indexes to TBLSPC too\n");
-	printf("  -o, --order-by=COLUMNS        order by columns instead of cluster keys\n");
-	printf("  -n, --no-order                do vacuum full instead of cluster\n");
-	printf("  -N, --dry-run                 print what would have been repacked\n");
-	printf("  -j, --jobs=NUM                Use this many parallel jobs for each table\n");
-	printf("  -i, --index=INDEX             move only the specified index\n");
-	printf("  -x, --only-indexes            move only indexes of the specified table\n");
-	printf("  -T, --wait-timeout=SECS       timeout to cancel other backends on conflict\n");
-	printf("  -D, --no-kill-backend         don't kill other backends when timed out\n");
-	printf("  -Z, --no-analyze              don't analyze at end\n");
-	printf("  -k, --no-superuser-check      skip superuser checks in client\n");
-	printf("  -C, --exclude-extension       don't repack tables which belong to specific extension\n");
-	printf("      --error-on-invalid-index  don't repack tables which belong to specific extension\n");
-	printf("      --apply-count             number of tuples to apply in one transaction during replay\n");
-	printf("      --switch-threshold        switch tables when that many tuples are left to catchup\n");
+	printf("  -a, --all                          repack all databases\n");
+	printf("  -t, --table=TABLE                  repack specific table only\n");
+	printf("  -I, --parent-table=TABLE           repack specific parent table and its inheritors\n");
+	printf("  -c, --schema=SCHEMA                repack tables in specific schema only\n");
+	printf("  -s, --tablespace=TBLSPC            move repacked tables to a new tablespace\n");
+	printf("  -S, --moveidx                      move repacked indexes to TBLSPC too\n");
+	printf("  -o, --order-by=COLUMNS             order by columns instead of cluster keys\n");
+	printf("  -n, --no-order                     do vacuum full instead of cluster\n");
+	printf("  -N, --dry-run                      print what would have been repacked\n");
+	printf("  -j, --jobs=NUM                     Use this many parallel jobs for each table\n");
+	printf("  -i, --index=INDEX                  move only the specified index\n");
+	printf("  -x, --only-indexes                 move only indexes of the specified table\n");
+	printf("  -T, --wait-timeout=SECS            timeout to cancel other backends on conflict\n");
+	printf("  -D, --no-kill-backend              don't kill other backends when timed out\n");
+	printf("  -Z, --no-analyze                   don't analyze at end\n");
+	printf("  -k, --no-superuser-check           skip superuser checks in client\n");
+	printf("  -C, --exclude-extension            don't repack tables which belong to specific extension\n");
+	printf("      --no-error-on-invalid-index    repack even though invalid index is found\n");
+	printf("      --error-on-invalid-index       don't repack when invalid index is found, deprecated, as this is the default behavior now\n");
+	printf("      --apply-count                  number of tuples to apply in one transaction during replay\n");
+	printf("      --switch-threshold             switch tables when that many tuples are left to catchup\n");
 }

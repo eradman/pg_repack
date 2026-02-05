@@ -102,10 +102,20 @@ static void swap_heap_or_index_files(Oid r1, Oid r2);
 
 /* check access authority */
 static void
-must_be_superuser(const char *func)
+must_be_owner(Oid relId)
 {
-	if (!superuser())
-		elog(ERROR, "must be superuser to use %s function", func);
+#if PG_VERSION_NUM >= 160000
+	if (!object_ownercheck(RelationRelationId, relId, GetUserId()))
+		aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(get_rel_relkind(relId)),
+					   get_rel_name(relId));
+#elif PG_VERSION_NUM >= 110000
+	if (!pg_class_ownercheck(relId, GetUserId()))
+		aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(get_rel_relkind(relId)),
+					   get_rel_name(relId));
+#else
+	if (!pg_class_ownercheck(relId, GetUserId()))
+		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_CLASS, get_rel_name(relId));
+#endif
 }
 
 
@@ -162,9 +172,6 @@ repack_trigger(PG_FUNCTION_ARGS)
 	Oid				argtypes[2];
 	Oid				relid;
 	StringInfo		sql;
-
-	/* authority check */
-	must_be_superuser("repack_trigger");
 
 	/* make sure it's called as a trigger at all */
 	if (!CALLED_AS_TRIGGER(fcinfo) ||
@@ -258,9 +265,6 @@ repack_apply(PG_FUNCTION_ARGS)
 	StringInfoData		sql_pop;
 
 	initStringInfo(&sql_pop);
-
-	/* authority check */
-	must_be_superuser("repack_apply");
 
 	/* connect to SPI manager */
 	repack_init();
@@ -859,7 +863,7 @@ repack_swap(PG_FUNCTION_ARGS)
 	Oid				owner2;
 
 	/* authority check */
-	must_be_superuser("repack_swap");
+	must_be_owner(oid);
 
 	/* connect to SPI manager */
 	repack_init();
@@ -905,7 +909,12 @@ repack_swap(PG_FUNCTION_ARGS)
 	 * Sanity check if both relations are locked in access exclusive mode
 	 * before swapping these files.
 	 */
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= 170000
+	if (! CheckRelationOidLockedByMe(oid, AccessExclusiveLock, true))
+		elog(ERROR, "must hold access exclusive lock on table \"%s\"", relname);
+	if (! CheckRelationOidLockedByMe(oid2, AccessExclusiveLock, true))
+		elog(ERROR, "must hold access exclusive lock on table \"table_%u\"", oid);
+#elif PG_VERSION_NUM >= 120000
 	{
 		LOCKTAG	tag;
 
@@ -1047,6 +1056,7 @@ repack_drop(PG_FUNCTION_ARGS)
 	int			numobj = PG_GETARG_INT32(1);
 	const char *relname = get_quoted_relname(oid);
 	const char *nspname = get_quoted_nspname(oid);
+	bool		trigger_exists = true;
 
 	if (!(relname && nspname))
 	{
@@ -1055,10 +1065,26 @@ repack_drop(PG_FUNCTION_ARGS)
 	}
 
 	/* authority check */
-	must_be_superuser("repack_drop");
+	must_be_owner(oid);
 
 	/* connect to SPI manager */
 	repack_init();
+
+	if (numobj > 0)
+	{
+		Oid			argtypes[1] = { OIDOID };
+		bool		nulls[1] = { 0 };
+		Datum		values[1];
+
+		values[0] = ObjectIdGetDatum(oid);
+		execute_with_args(SPI_OK_SELECT,
+			"SELECT tgname"
+			"  FROM pg_trigger"
+			" WHERE tgrelid = $1 AND tgname = 'repack_trigger'",
+			1, argtypes, values, nulls);
+
+		trigger_exists = SPI_processed > 0;
+	}
 
 	/*
 	 * To prevent concurrent lockers of the repack target table from causing
@@ -1077,14 +1103,9 @@ repack_drop(PG_FUNCTION_ARGS)
 	 *
 	 * Fixes deadlock mentioned in the Github issue #55.
 	 *
-	 * Skip the lock if we are not going to do anything.
-	 * Otherwise, if repack gets accidentally run twice for the same table
-	 * at the same time, the second repack, in order to perform
-	 * a pointless cleanup, has to wait until the first one completes.
-	 * This adds an ACCESS EXCLUSIVE lock request into the queue
-	 * making the table effectively inaccessible for any other backend.
+	 * Skip the lock if we are not going to drop the trigger.
 	 */
-	if (numobj > 0)
+	if (numobj > 0 && trigger_exists)
 	{
 		execute_with_format(
 			SPI_OK_UTILITY,
@@ -1121,10 +1142,11 @@ repack_drop(PG_FUNCTION_ARGS)
 	 */
 	if (numobj > 0)
 	{
-		execute_with_format(
-			SPI_OK_UTILITY,
-			"DROP TRIGGER IF EXISTS repack_trigger ON %s.%s CASCADE",
-			nspname, relname);
+		if (trigger_exists)
+			execute_with_format(
+				SPI_OK_UTILITY,
+				"DROP TRIGGER IF EXISTS repack_trigger ON %s.%s CASCADE",
+				nspname, relname);
 		--numobj;
 	}
 
@@ -1408,7 +1430,7 @@ repack_index_swap(PG_FUNCTION_ARGS)
 	HeapTuple          tuple;
 
 	/* authority check */
-	must_be_superuser("repack_index_swap");
+	must_be_owner(orig_idx_oid);
 
 	/* connect to SPI manager */
 	repack_init();
